@@ -1,0 +1,429 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+
+class AttentionBlock(nn.Module):
+    def __init__(self, inplane, groups=4, map_size=(8, 14, 16), head_num=8, v_len=16, qk_len=8):
+        super(AttentionBlock, self).__init__()
+        self.conv_layer = nn.Sequential(
+            nn.Conv3d(inplane, inplane, kernel_size=(3, 3, 3), padding=(1, 1, 1), groups=groups, bias=False),
+            nn.InstanceNorm3d(inplane),
+            nn.LeakyReLU(),
+            nn.Conv3d(inplane, inplane, kernel_size=(3, 3, 3), padding=(1, 1, 1), groups=groups, bias=False),
+            nn.InstanceNorm3d(inplane),
+            nn.LeakyReLU(),
+            nn.MaxPool3d((2, 4, 4))
+        )
+        qkv_inchannel = map_size[0] * map_size[1] * map_size[2]
+        self.head_num = head_num
+        self.v_len = v_len
+        self.qk_len = qk_len
+        self.to_qkv = nn.Sequential(
+            nn.Linear(qkv_inchannel, head_num * (v_len + 2 * qk_len)),
+            nn.BatchNorm1d(head_num * (v_len + 2 * qk_len)),
+            nn.LeakyReLU()
+        )
+        self.norm_attn = nn.InstanceNorm2d(head_num)
+        self.norm_v = nn.InstanceNorm2d(head_num)
+
+        self.out = nn.Sequential(
+            nn.Linear(head_num*v_len, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        h = x
+        x = self.conv_layer(x)
+        B, C, Q, H, W = x.shape
+        qkv = self.to_qkv(x.reshape([B*C, -1]))
+        qkv = qkv.reshape([B, C, self.head_num, -1])
+        v, q, k = torch.split(qkv, [self.v_len, self.qk_len, self.qk_len], dim=3)
+        attention = self.norm_attn(torch.einsum('bchi,bnhi->bhcn', q, k)).reshape([B, self.head_num, C, C])
+        attention = F.softmax(attention, dim=-1)
+        attn_v = self.norm_v(torch.einsum('bhcj,bjhi->bhci', attention, v)).permute([0, 2, 1, 3]).reshape(B, C, -1)
+        attn_out = self.out(attn_v).reshape(B, C, 1, 1, 1)
+        h = h * attn_out  + h
+        return h
+
+class ResidualBlock(nn.Module):
+    def __init__(self, inplanes, planes, stride=(1, 1, 1), kernal_size=(3, 3, 3), dilation=(1, 1, 1), downsample=None):
+        super(ResidualBlock, self).__init__()
+        padding1 = dilation if kernal_size[0] == 3 else (0, dilation[1], dilation[2])
+        padding2 = (1, 1, 1) if kernal_size[0] == 3 else (0, 1, 1)
+
+        self.conv1 = nn.Conv3d(inplanes, planes, kernal_size, stride=stride,
+                               dilation=dilation, padding=padding1, bias=False)
+        self.norm1 = nn.InstanceNorm3d(planes)
+        self.relu = nn.LeakyReLU()
+
+        self.conv2 = nn.Conv3d(planes, planes, kernal_size, padding=padding2, bias=False)
+        self.norm2 = nn.InstanceNorm3d(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.norm1(self.conv1(x)))
+        out = self.norm2(self.conv2(out))
+
+        if self.downsample is not None:
+            residual = self.downsample(residual)
+        out += residual
+        out = self.relu(out)
+        return out
+
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool3d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction, bias=False),
+            nn.LeakyReLU(),
+            nn.Linear(channel // reduction, channel, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _, _ = x.shape
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1, 1)
+        return x * y.expand_as(x)
+
+class SEBasicBlock(nn.Module):
+    def __init__(self, inplanes, planes, stride=(1, 1, 1), kernal_size=(3, 3, 3), dilation=(1, 1, 1), downsample=None):
+        super(SEBasicBlock, self).__init__()
+        padding1 = dilation if kernal_size[0] == 3 else (0, dilation[1], dilation[2])
+        padding2 = (1, 1, 1) if kernal_size[0] == 3 else (0, 1, 1)
+
+        self.conv1 = nn.Conv3d(inplanes, planes, kernal_size, stride=stride,
+                               dilation=dilation, padding=padding1, bias=False)
+        self.norm1 = nn.InstanceNorm3d(planes)
+        self.relu = nn.LeakyReLU()
+
+        self.conv2 = nn.Conv3d(planes, planes, kernal_size, padding=padding2, bias=False)
+        self.norm2 = nn.InstanceNorm3d(planes)
+        self.selayer = SELayer(planes)
+        self.downsample = downsample
+
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.norm1(self.conv1(x)))
+        out = self.selayer(self.norm2(self.conv2(out)))
+
+        if self.downsample is not None:
+            residual = self.downsample(residual)
+        out += residual
+        out = self.relu(out)
+        return out
+
+class _DilationBlock(nn.Sequential):
+    def __init__(self, in_plane, mid_plane=128, out_plane=64, dilation=(1, 1, 1), drop_out=0.):
+        super(_DilationBlock, self).__init__()
+        self.add_module('conv1', nn.Conv3d(in_plane, mid_plane, (1, 1, 1), bias=False))
+        self.add_module('norm1', nn.InstanceNorm3d(mid_plane))
+        self.add_module('relu1', nn.LeakyReLU())
+
+        self.add_module('conv2', nn.Conv3d(mid_plane, out_plane, (3, 3, 3), dilation=dilation,
+                                           padding=dilation, bias=False))
+        self.add_module('norm2', nn.InstanceNorm3d(out_plane))
+        self.add_module('relu2', nn.LeakyReLU())
+
+        self.drop_out = drop_out
+
+    def forward(self, x):
+        x = super(_DilationBlock, self).forward(x)
+        if self.drop_out > 0.:
+            x = F.dropout3d(x, p=self.drop_out, training=self.training)
+        return x
+
+class DenseASPPBlock(nn.Module):
+    def __init__(self, inplane, midplane=128, outplane=64, drop_out=0.):
+        super(DenseASPPBlock, self).__init__()
+        self.dilation1 = _DilationBlock(inplane, midplane, outplane, dilation=(1, 3, 3), drop_out=drop_out)
+        inplane = inplane + outplane
+        self.dilation2 = _DilationBlock(inplane, midplane, outplane, dilation=(1, 6, 6), drop_out=drop_out)
+        inplane = inplane + outplane
+        self.dilation3 = _DilationBlock(inplane, midplane, outplane, dilation=(2, 12, 12), drop_out=drop_out)
+        inplane = inplane + outplane
+        self.dilation4 = _DilationBlock(inplane, midplane, outplane, dilation=(4, 18, 18), drop_out=drop_out)
+
+    def forward(self, feature):
+        out = self.dilation1(feature)
+        feature = torch.cat([feature, out], dim=1)
+        out = self.dilation2(feature)
+        feature = torch.cat([feature, out], dim=1)
+        out = self.dilation3(feature)
+        feature = torch.cat([feature, out], dim=1)
+        out = self.dilation4(feature)
+        feature = torch.cat([feature, out], dim=1)
+
+        return feature
+
+
+class S_Net(nn.Module):
+    def __init__(self, n_class, basic_plane=64, daspp_mid_plane=128, daspp_out_plane=64, daspp_dropout=0.):
+        super(S_Net, self).__init__()
+        self.en1 = nn.Sequential(
+            nn.Conv3d(1, basic_plane, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU(),
+            nn.Conv3d(basic_plane, basic_plane, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU()
+        )
+        self.pool1 = nn.MaxPool3d((1, 2, 2))
+
+        self.se_layer1 = self._make_layer(SEBasicBlock, 2, basic_plane, basic_plane*2,  kernal_size=(1, 3, 3))
+        self.pool2 = nn.MaxPool3d((1, 2, 2))
+        self.se_layer2 = self._make_layer(SEBasicBlock, 2, basic_plane*2, basic_plane*4, kernal_size=(3, 3, 3))
+        self.se_layer3 = self._make_layer(SEBasicBlock, 1, basic_plane*4, basic_plane*4, kernal_size=(3, 3, 3), dilation=(2, 2, 2))
+        self.dense_aspp = DenseASPPBlock(basic_plane*4, daspp_mid_plane, daspp_out_plane, daspp_dropout)
+        self.attn_plane = daspp_out_plane*4
+        #self.attention = AttentionBlock(daspp_out_plane*4)
+        self.se_aft_aspp = self._make_layer(SEBasicBlock, 1, basic_plane*4 + daspp_out_plane*4, basic_plane*4)
+
+        self.upsample1 = nn.Sequential(
+            nn.ConvTranspose3d(basic_plane*4, basic_plane*2, kernel_size=(1, 2, 2), stride=(1, 2, 2), bias=False),
+            nn.InstanceNorm3d(basic_plane*2),
+            nn.LeakyReLU()
+        )
+        self.de_se2 = self._make_layer(SEBasicBlock, 1, basic_plane*4, basic_plane*2, kernal_size=(1, 3, 3))
+        self.upsample2 = nn.Sequential(
+            nn.ConvTranspose3d(basic_plane*2, basic_plane, kernel_size=(1, 2, 2), stride=(1, 2, 2), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU()
+        )
+        self.de_se3 = self._make_layer(SEBasicBlock, 1, basic_plane*2, basic_plane, kernal_size=(1, 3, 3))
+        # self.to_out = nn.Conv3d(basic_plane, n_class, (1, 1, 1))
+        '''
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_uniform(m.weight.data)
+
+            elif isinstance(m, nn.InstanceNorm3d):
+                nn.init.constant(m.weight, 1)
+                nn.init.constant(m.bias, 0)
+        '''
+
+    def _make_layer(self, block, block_num, inplane, plane, kernal_size=(3, 3, 3), stride=(1, 1, 1), dilation=(1, 1, 1)):
+        down_sample = None
+        if inplane != plane or stride != (1, 1, 1):
+            down_sample = nn.Sequential(
+                nn.Conv3d(inplane, plane, (1, 1, 1), stride=stride, bias=False),
+                nn.InstanceNorm3d(plane),
+            )
+
+        layers = [block(inplane, plane, stride, kernal_size, dilation, down_sample)]
+        for _ in range(1, block_num):
+            layers.append(block(plane, plane, kernal_size=kernal_size))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        en1 = self.en1(x)
+        en2 = self.se_layer1(self.pool1(en1))
+        en3 = self.se_layer2(self.pool2(en2))
+        # print(f'en 1-3: {en1.shape, en2.shape, en3.shape},')
+        en3_ = self.se_layer3(en3)
+        daspp = self.dense_aspp(en3_)
+        #daspp = torch.cat([daspp[:, :-self.attn_plane], self.attention(daspp[:, -self.attn_plane:])], dim=1)
+        # print(f'aspp: {en3_.shape, daspp.shape}')
+        dn1 = self.se_aft_aspp(daspp)
+        dn2 = self.de_se2(torch.cat([self.upsample1(dn1), en2], dim=1))
+        dn3 = self.de_se3(torch.cat([self.upsample2(dn2), en1], dim=1))
+        # print(f'dn 1-3: {dn1.shape, dn2.shape, dn3.shape}')
+        #out = self.to_out(dn3)
+        out = dn3
+        return out
+
+
+class DASPP_Res_UNet(nn.Module):
+    def __init__(self, n_class, basic_plane=64, daspp_mid_plane=128, daspp_out_plane=64, daspp_dropout=0.):
+        super(DASPP_Res_UNet, self).__init__()
+        self.en1 = nn.Sequential(
+            nn.Conv3d(1, basic_plane, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU(),
+            nn.Conv3d(basic_plane, basic_plane, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU()
+        )
+        self.pool1 = nn.MaxPool3d((1, 2, 2))
+
+        self.se_layer1 = self._make_layer(ResidualBlock, 2, basic_plane, basic_plane*2,  kernal_size=(1, 3, 3))
+        self.pool2 = nn.MaxPool3d((1, 2, 2))
+        self.se_layer2 = self._make_layer(ResidualBlock, 2, basic_plane*2, basic_plane*4, kernal_size=(3, 3, 3))
+        self.se_layer3 = self._make_layer(ResidualBlock, 1, basic_plane*4, basic_plane*4, kernal_size=(3, 3, 3), dilation=(2, 2, 2))
+        self.dense_aspp = DenseASPPBlock(basic_plane*4, daspp_mid_plane, daspp_out_plane, daspp_dropout)
+        #self.attn_plane = daspp_out_plane*4
+        #self.attention = AttentionBlock(daspp_out_plane*4)
+        self.se_aft_aspp = self._make_layer(ResidualBlock, 1, basic_plane*4 + daspp_out_plane*4, basic_plane*4)
+
+        self.upsample1 = nn.Sequential(
+            nn.ConvTranspose3d(basic_plane*4, basic_plane*2, kernel_size=(1, 2, 2), stride=(1, 2, 2), bias=False),
+            nn.InstanceNorm3d(basic_plane*2),
+            nn.LeakyReLU()
+        )
+        self.de_se2 = self._make_layer(ResidualBlock, 1, basic_plane*4, basic_plane*2, kernal_size=(1, 3, 3))
+        self.upsample2 = nn.Sequential(
+            nn.ConvTranspose3d(basic_plane*2, basic_plane, kernel_size=(1, 2, 2), stride=(1, 2, 2), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU()
+        )
+        self.de_se3 = self._make_layer(ResidualBlock, 1, basic_plane*2, basic_plane, kernal_size=(1, 3, 3))
+        self.to_out = nn.Conv3d(basic_plane, n_class, (1, 1, 1))
+        '''
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_uniform(m.weight.data)
+
+            elif isinstance(m, nn.InstanceNorm3d):
+                nn.init.constant(m.weight, 1)
+                nn.init.constant(m.bias, 0)
+        '''
+
+    def _make_layer(self, block, block_num, inplane, plane, kernal_size=(3, 3, 3), stride=(1, 1, 1), dilation=(1, 1, 1)):
+        down_sample = None
+        if inplane != plane or stride != (1, 1, 1):
+            down_sample = nn.Sequential(
+                nn.Conv3d(inplane, plane, (1, 1, 1), stride=stride, bias=False),
+                nn.InstanceNorm3d(plane),
+            )
+
+        layers = [block(inplane, plane, stride, kernal_size, dilation, down_sample)]
+        for _ in range(1, block_num):
+            layers.append(block(plane, plane, kernal_size=kernal_size))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        en1 = self.en1(x)
+        en2 = self.se_layer1(self.pool1(en1))
+        en3 = self.se_layer2(self.pool2(en2))
+        # print(f'en 1-3: {en1.shape, en2.shape, en3.shape},')
+        en3_ = self.se_layer3(en3)
+        daspp = self.dense_aspp(en3_)
+        #daspp = torch.cat([daspp[:, :-self.attn_plane], self.attention(daspp[:, -self.attn_plane:])], dim=1)
+        # print(f'aspp: {en3_.shape, daspp.shape}')
+        dn1 = self.se_aft_aspp(daspp)
+        dn2 = self.de_se2(torch.cat([self.upsample1(dn1), en2], dim=1))
+        dn3 = self.de_se3(torch.cat([self.upsample2(dn2), en1], dim=1))
+        # print(f'dn 1-3: {dn1.shape, dn2.shape, dn3.shape}')
+        out = self.to_out(dn3)
+        return out
+
+
+class S_Tiny_Net(nn.Module):
+    def __init__(self, n_class, basic_plane=64, daspp_mid_plane=128, daspp_out_plane=64, daspp_dropout=0.):
+        super(S_Tiny_Net, self).__init__()
+        self.en1 = nn.Sequential(
+            nn.Conv3d(1, basic_plane, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU(),
+            nn.Conv3d(basic_plane, basic_plane, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU()
+        )
+        self.pool1 = nn.MaxPool3d((1, 2, 2))
+
+        self.en2 = nn.Sequential(
+            nn.Conv3d(basic_plane, basic_plane*2, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane*2),
+            nn.LeakyReLU(),
+            nn.Conv3d(basic_plane*2, basic_plane * 2, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane * 2),
+            nn.LeakyReLU()
+        )
+        self.pool2 = nn.MaxPool3d((1, 2, 2))
+
+        self.en3 = nn.Sequential(
+            nn.Conv3d(basic_plane*2, basic_plane * 4, (3, 3, 3), padding=(1, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane * 4),
+            nn.LeakyReLU(),
+            nn.Conv3d(basic_plane*4, basic_plane * 4, (3, 3, 3), padding=(1, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane * 4),
+            nn.LeakyReLU(),
+            nn.Conv3d(basic_plane * 4, basic_plane * 4, (3, 3, 3), dilation=(2, 2, 2), padding=(2, 2, 2), bias=False),
+            nn.InstanceNorm3d(basic_plane * 4),
+            nn.LeakyReLU(),
+            nn.Conv3d(basic_plane * 4, basic_plane * 4, (3, 3, 3), padding=(1, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane * 4),
+            nn.LeakyReLU()
+        )
+        self.dense_aspp = DenseASPPBlock(basic_plane*4, daspp_mid_plane, daspp_out_plane, daspp_dropout)
+        self.se_aft_aspp = self._make_layer(SEBasicBlock, 1, basic_plane*4 + daspp_out_plane*4, basic_plane*4)
+
+        self.upsample1 = nn.Sequential(
+            nn.ConvTranspose3d(basic_plane*4, basic_plane*2, kernel_size=(1, 2, 2), stride=(1, 2, 2), bias=False),
+            nn.InstanceNorm3d(basic_plane*2),
+            nn.LeakyReLU()
+        )
+        #self.de_se2 = self._make_layer(SEBasicBlock, 1, basic_plane*4, basic_plane*2, kernal_size=(1, 3, 3))
+        self.de2 = nn.Sequential(
+            nn.Conv3d(basic_plane*4, basic_plane*2, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane*2),
+            nn.LeakyReLU(),
+            nn.Conv3d(basic_plane*2, basic_plane * 2, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane * 2),
+            nn.LeakyReLU()
+        )
+        self.upsample2 = nn.Sequential(
+            nn.ConvTranspose3d(basic_plane*2, basic_plane, kernel_size=(1, 2, 2), stride=(1, 2, 2), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU()
+        )
+        #self.de_se3 = self._make_layer(SEBasicBlock, 1, basic_plane*2, basic_plane, kernal_size=(1, 3, 3))
+        self.de3 = nn.Sequential(
+            nn.Conv3d(basic_plane * 2, basic_plane, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU(),
+            nn.Conv3d(basic_plane, basic_plane, (1, 3, 3), padding=(0, 1, 1), bias=False),
+            nn.InstanceNorm3d(basic_plane),
+            nn.LeakyReLU()
+        )
+        self.to_out = nn.Conv3d(basic_plane, n_class, (1, 1, 1))
+        '''
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_uniform(m.weight.data)
+
+            elif isinstance(m, nn.InstanceNorm3d):
+                nn.init.constant(m.weight, 1)
+                nn.init.constant(m.bias, 0)
+        '''
+    def _make_layer(self, block, block_num, inplane, plane, kernal_size=(3, 3, 3), stride=(1, 1, 1), dilation=(1, 1, 1)):
+        down_sample = None
+        if inplane != plane or stride != (1, 1, 1):
+            down_sample = nn.Sequential(
+                nn.Conv3d(inplane, plane, (1, 1, 1), stride=stride, bias=False),
+                nn.InstanceNorm3d(plane),
+            )
+
+        layers = [block(inplane, plane, stride, kernal_size, dilation, down_sample)]
+        for _ in range(1, block_num):
+            layers.append(block(plane, plane, kernal_size=kernal_size))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        en1 = self.en1(x)
+        en2 = self.en2(self.pool1(en1))
+        en3 = self.en3(self.pool2(en2))
+        #print(f'en 1-3: {en1.shape, en2.shape, en3.shape},')
+        daspp = self.dense_aspp(en3)
+        #print(f'aspp: {en3_.shape, daspp.shape}')
+        dn1 = self.se_aft_aspp(daspp)
+        dn2 = self.de2(torch.cat([self.upsample1(dn1), en2], dim=1))
+        dn3 = self.de3(torch.cat([self.upsample2(dn2), en1], dim=1))
+        #print(f'dn 1-3: {dn1.shape, dn2.shape, dn3.shape}')
+        out = self.to_out(dn3)
+        return out
+
+
+if __name__ == '__main__':
+    x = torch.zeros([1, 1, 16, 256, 256])
+    model = S_Net(n_class=2, basic_plane=32, daspp_mid_plane=64, daspp_out_plane=32)
+    y = model(x)
+
+
