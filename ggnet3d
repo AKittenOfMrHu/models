@@ -1,0 +1,246 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from model.resNeXt3D import ResNeXt3DForGGNet
+from model.resNeXt3D import ResNeXtBottleneck, ResNeXtBasicBlock
+
+class ASPP_module(nn.Module):
+    def __init__(self, inplanes, planes, rate):
+        super(ASPP_module, self).__init__()
+        rate_list = (1, rate, rate)
+        self.atrous_convolution = nn.Conv3d(inplanes, planes, kernel_size=3,
+                                            stride=1, padding=rate_list, dilation=rate_list)
+        self.group_norm = nn.GroupNorm(24, planes)
+        self._init_weight()
+
+    def forward(self, x):
+        x = self.atrous_convolution(x)
+        x = self.group_norm(x)
+        return x
+
+    def _init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                torch.nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.BatchNorm3d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+class BoundaryModule(nn.Module):
+    def __init__(self, plane):
+        super(BoundaryModule, self).__init__()
+        self.squeeze = nn.Conv3d(plane, 1, 1)
+        self.maxpooling = nn.MaxPool3d((1, 3, 3), stride=1, padding=(0, 1, 1))
+
+    def forward(self, x):
+        x1 = self.squeeze(x)
+        x2 = self.maxpooling(x1)
+        boundary = x1 - x2
+        segmentation = x1 + boundary
+        return segmentation, boundary
+
+class SpatialGuidance(nn.Module):
+    def __init__(self, plane, down_size=(5, 20, 20)):
+        super(SpatialGuidance, self).__init__()
+        self.wk = nn.Sequential(
+            nn.Conv3d(plane, plane, 1),
+            nn.InstanceNorm3d(plane),
+            nn.ReLU()
+        )
+        self.wq = nn.Sequential(
+            nn.Conv3d(plane, plane, 1),
+            nn.InstanceNorm3d(plane),
+            nn.ReLU()
+        )
+        self.wv = nn.Sequential(
+            nn.Conv3d(plane, plane, 1),
+            nn.InstanceNorm3d(plane),
+            nn.ReLU()
+        )
+        self.wgk = nn.Sequential(
+            nn.Conv3d(plane, plane, 1),
+            nn.InstanceNorm3d(plane),
+            nn.ReLU()
+        )
+        self.wgq = nn.Sequential(
+            nn.Conv3d(plane, plane, 1),
+            nn.InstanceNorm3d(plane),
+            nn.ReLU()
+        )
+        self.down_size = down_size
+
+    def forward(self, feature, guidance):
+        B, C, Q, H, W = feature.shape
+        feaK = self.wk(feature).reshape(B, C, -1)
+        feaQ = self.wq(feature).reshape(B, C, -1).permute(0, 2, 1)
+        feaV = self.wv(feature).reshape(B, C, -1)
+        feaQK = torch.softmax(torch.bmm(feaQ, feaK), dim=-1)
+        guiK = self.wgk(guidance).reshape(B, C, -1)
+        guiQ = self.wgq(guidance).reshape(B, C, -1).permute(0, 2, 1)
+        guiQK = torch.softmax(torch.bmm(guiQ, guiK), dim=-1)
+        smQK = torch.softmax(feaQK * guiQK, dim=-1)
+        reshapeY = torch.bmm(feaV, smQK.permute(0, 2, 1)).reshape(B, C, Q, H, W)
+        #y = F.interpolate(reshapeY + feature, (QV0, HV0, WV0), mode='trilinear')
+        y = reshapeY + feature
+        return y
+
+class ChannalGuidance(nn.Module):
+    def __init__(self, plane, down_size=(5, 20, 20)):
+        super(ChannalGuidance, self).__init__()
+        self.down_size = down_size
+        self.selayer = nn.Sequential(
+            nn.Conv3d(plane, plane, 1),
+            nn.ReLU(),
+            nn.Conv3d(plane, plane, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, feature, guidance):
+        B, C, Q, H, W = feature.shape
+        fea_flttn = feature.reshape(B, C, -1)
+        fea_attn = torch.softmax(torch.bmm(fea_flttn, fea_flttn.permute(0, 2, 1)), dim=-1)
+        gui_se = self.selayer(F.adaptive_avg_pool3d(guidance, (1, 1, 1)))
+        gui_flttn = (gui_se * guidance).reshape(B, C, -1)
+        gui_attn = torch.softmax(torch.bmm(gui_flttn, gui_flttn.permute(0, 2, 1)), dim=-1)
+        attn = torch.softmax(fea_attn * gui_attn, dim=-1)
+        reshapeZ = torch.bmm(attn, fea_flttn).reshape(B, C, Q, H, W)
+        Z = reshapeZ + feature
+        return Z
+
+class BackBone3D(nn.Module):
+    def __init__(self):
+        super(BackBone3D, self).__init__()
+        net = ResNeXt3DForGGNet(ResNeXtBottleneck, [3, 4, 6, 3], num_classes=2)
+        # resnext3d-101 is [3, 4, 23, 3]
+        # we use the resnet3d-50 with [3, 4, 6, 3] blocks
+        # and if we use the resnet3d-101, change the block list with [3, 4, 23, 3]
+        net = list(net.children())
+        self.layer0 = nn.Sequential(*net[:3])
+        # the layer0 contains the first convolution, bn and relu
+        self.layer1 = nn.Sequential(*net[3:5])
+        # the layer1 contains the first pooling and the first 3 bottle blocks
+        self.layer2 = net[5]
+        # the layer2 contains the second 4 bottle blocks
+        self.layer3 = net[6]
+        # the layer3 contains the media bottle blocks
+        # with 6 in 50-layers and 23 in 101-layers
+        self.layer4 = net[7]
+        # the layer4 contains the final 3 bottle blocks
+        # according the backbone the next is avg-pooling and dense with num classes uints
+        # but we don't use the final two layers in backbone networks
+
+    def forward(self, x):
+        layer0 = self.layer0(x)
+        layer1 = self.layer1(layer0)
+        layer2 = self.layer2(layer1)
+        layer3 = self.layer3(layer2)
+        layer4 = self.layer4(layer3)
+        return layer4
+
+class GGNet(nn.Module):
+    def __init__(self):
+        super(GGNet, self).__init__()
+        self.backbone = BackBone3D()
+
+        self.blbd1 = BoundaryModule(128)
+        self.blbd2 = BoundaryModule(256)
+        self.blbd3 = BoundaryModule(512)
+        self.blbd4 = BoundaryModule(1024)
+
+        self.down4 = nn.Sequential(
+            nn.Conv3d(1024, 48, kernel_size=1),
+            nn.GroupNorm(24, 48),
+            nn.PReLU(),
+        )
+        self.down3 = nn.Sequential(
+            nn.Conv3d(512, 48, kernel_size=1),
+            nn.GroupNorm(24, 48),
+            nn.PReLU()
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv3d(256, 48, kernel_size=1),
+            nn.GroupNorm(24, 48),
+            nn.PReLU()
+        )
+        self.down1 = nn.Sequential(
+            nn.Conv3d(128, 48, kernel_size=1),
+            nn.GroupNorm(24, 48),
+            nn.PReLU()
+        )
+
+        rates = (1, 6, 12, 18)
+        self.aspp1 = ASPP_module(1024, 48, rate=rates[0])
+        self.aspp2 = ASPP_module(1024, 48, rate=rates[1])
+        self.aspp3 = ASPP_module(1024, 48, rate=rates[2])
+        self.aspp4 = ASPP_module(1024, 48, rate=rates[3])
+
+        self.spatial_layer = SpatialGuidance(192)
+        self.channel_layer = ChannalGuidance(192)
+        self.predict = nn.Conv3d(192, 1, 1)
+
+
+    def forward(self, x):
+        layer0 = self.backbone.layer0(x)
+        layer1 = self.backbone.layer1(layer0)
+        layer2 = self.backbone.layer2(layer1)
+        layer3 = self.backbone.layer3(layer2)
+        layer4 = self.backbone.layer4(layer3)
+        #print(layer1.shape, layer2.shape, layer3.shape, layer4.shape)
+        # Top-down
+        down4 = self.down4(layer4)
+        down3 = self.down3(layer3)
+        down2 = self.down2(layer2)
+        down1 = self.down1(layer1)
+        # down4 = F.upsample(down4, size=layer1.size()[2:], mode='trilinear')
+        # down3 = F.upsample(down3, size=layer1.size()[2:], mode='trilinear')
+        # down2 = F.upsample(down2, size=layer1.size()[2:], mode='trilinear')
+        #down4 = F.adaptive_max_pool3d(down4, layer4.size()[-3:])
+        down3 = F.adaptive_max_pool3d(down3, layer4.size()[-3:])
+        down2 = F.adaptive_max_pool3d(down2, layer4.size()[-3:])
+        down1 = F.adaptive_max_pool3d(down1, layer4.size()[-3:])
+
+        aspp1 = self.aspp1(layer4)
+        aspp2 = self.aspp2(layer4)
+        aspp3 = self.aspp3(layer4)
+        aspp4 = self.aspp4(layer4)
+
+        featureX = torch.relu(torch.cat((aspp1, aspp2, aspp3, aspp4), dim=1))
+        #featureX = F.upsample(featureX, size=layer1.size()[2:], mode='trilinear')
+        guidance = torch.cat([down1, down2, down3, down4], dim=1)
+        #guidance = F.adaptive_max_pool3d(guidance, featureX.shape[-3:])
+        featureY = self.spatial_layer(featureX, guidance)
+        featureZ = self.channel_layer(featureY, guidance)
+        #print(f'featureX: {featureZ.shape}')
+
+        predict = F.upsample(featureZ, size=x.size()[2:], mode='trilinear')
+        predict = self.predict(predict)
+
+        if self.training:
+            # blbd
+            sgm1, bdr1 = self.blbd1(layer1)
+            sgm2, bdr2 = self.blbd2(layer2)
+            sgm3, bdr3 = self.blbd3(layer3)
+            sgm4, bdr4 = self.blbd4(layer4)
+            sgm1 = F.upsample(sgm1, size=x.size()[2:], mode='trilinear')
+            sgm2 = F.upsample(sgm2, size=x.size()[2:], mode='trilinear')
+            sgm3 = F.upsample(sgm3, size=x.size()[2:], mode='trilinear')
+            sgm4 = F.upsample(sgm4, size=x.size()[2:], mode='trilinear')
+            bdr1 = F.upsample(bdr1, size=x.size()[2:], mode='trilinear')
+            bdr2 = F.upsample(bdr2, size=x.size()[2:], mode='trilinear')
+            bdr3 = F.upsample(bdr3, size=x.size()[2:], mode='trilinear')
+            bdr4 = F.upsample(bdr4, size=x.size()[2:], mode='trilinear')
+            return sgm1, sgm2, sgm3, sgm4, bdr1, bdr2, bdr3, bdr4, predict
+        else:
+            return predict
+
+
+if __name__ == '__main__':
+    feature = torch.rand((2, 1024, 10, 180, 180))
+    guidance = torch.rand((2, 1024, 10, 180, 180))
+    model = SpatialGuidance(1024)
+
+    model(feature, guidance)
+
+
+
