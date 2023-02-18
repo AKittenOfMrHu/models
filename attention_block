@@ -1,0 +1,99 @@
+###########################################
+##Author: Ll
+##Date: 2021-10-18 22:24:45
+##LastEditors: Ll
+##LastEditTime: 2021-10-24 20:51:31
+##Description: file content
+##FilePath: \classification_version1d:\Desktop\test.py
+###########################################
+# specific modules
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class PAM_Module(nn.Module):
+
+    def __init__(self, in_dim, channels_down=8):
+        super(PAM_Module, self).__init__()
+        self.chanel_in = in_dim
+
+        # query, key, value convolution
+        self.query_conv = nn.Conv3d(in_channels=in_dim, out_channels=in_dim // channels_down, kernel_size=1)
+        self.key_conv = nn.Conv3d(in_channels=in_dim, out_channels=in_dim // channels_down, kernel_size=1)
+        self.value_conv = nn.Conv3d(in_channels=in_dim, out_channels=in_dim, kernel_size=1)
+
+        # parameters that control the output weight
+        self.gamma = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        # input shape
+        B, C, Q, H, W = x.size()
+
+        # project the value to (B, HxW, C), (B, C, HxW), (B, C, HxW)
+        proj_query = self.query_conv(x).view(B, -1, Q * W * H).permute(0, 2, 1)
+        proj_key = self.key_conv(x).view(B, -1, Q * W * H)
+        proj_value = self.value_conv(x).view(B, -1, Q * W * H)
+
+        # obtain the attention map
+        attention = F.softmax(torch.bmm(proj_query, proj_key), dim=-1)
+
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1)).view(B, C, Q, H, W)
+
+        # reweigh the attention output and original input
+        out = self.gamma * out + x
+
+        return out
+
+
+class CAM_Module(nn.Module):
+
+    def __init__(self, in_dim):
+        super(CAM_Module, self).__init__()
+        self.chanel_in = in_dim
+
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        """
+            inputs :
+                x : input feature maps( B X C X H X W)
+            returns :
+                out : attention value + input feature
+                attention: B X C X C
+        """
+
+        B, C, Q, H, W = x.size()
+
+        # project the value to (B, C, HxW), (B, HxW, C), (B, C, HxW)
+        proj_query = x.view(B, C, -1)
+        proj_key = x.view(B, C, -1).permute(0, 2, 1)
+        proj_value = x.view(B, C, -1)
+
+        energy = torch.bmm(proj_query, proj_key)
+        energy_new = torch.max(energy, -1, keepdim=True)[0].expand_as(energy) - energy
+        attention = F.softmax(energy_new, dim=-1)
+
+        out = torch.bmm(attention, proj_value).view(B, C, Q, H, W)
+
+        out = self.gamma * out + x
+        return out
+
+
+class Mymodel(nn.Module):
+    def __init__(self, in_channels, n_classes):
+        super(Mymodel, self).__init__()
+        self.extractor()
+        self.pam = PAM_Module(512)
+        self.pam = CAM_Module(512)
+
+
+def forward(self, x):
+    feat = self.extractor(x)
+    p_feat = self.pam(feat)
+    c_feat = self.cam(feat)
+
+    feat = torch.cat([p_feat, c_feat], dim=1)
+    feat = F.adaptive_avg_pool3d(feat, (1, 1, 1)).view(feat.shape[0], -1)
+
+    return self.classify(feat)
