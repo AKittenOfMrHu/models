@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
+#=========================================== QKV, self attention ===============================
 class PAM_Module(nn.Module):
 
     def __init__(self, in_dim, channels_down=8):
@@ -88,12 +88,64 @@ class Mymodel(nn.Module):
         self.pam = CAM_Module(512)
 
 
-def forward(self, x):
-    feat = self.extractor(x)
-    p_feat = self.pam(feat)
-    c_feat = self.cam(feat)
+    def forward(self, x):
+        feat = self.extractor(x)
+        p_feat = self.pam(feat)
+        c_feat = self.cam(feat)
 
-    feat = torch.cat([p_feat, c_feat], dim=1)
-    feat = F.adaptive_avg_pool3d(feat, (1, 1, 1)).view(feat.shape[0], -1)
+        feat = torch.cat([p_feat, c_feat], dim=1)
+        feat = F.adaptive_avg_pool3d(feat, (1, 1, 1)).view(feat.shape[0], -1)
 
-    return self.classify(feat)
+        return self.classify(feat)
+
+# ------------------------------------------------------------------------------------------
+
+
+
+# ======================================= no self attention ================================================
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)  # 7,3     3,1
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+        
+    def forward(self, x):
+        out = x * self.ca(x)
+        result = out * self.sa(out)
+        return result
