@@ -1,0 +1,123 @@
+class ASPP(nn.Module):
+    def __init__(self, input_nc, atrous_rates, output_nc):
+        super(ASPP, self).__init__()
+        modules = []
+        modules.append(nn.Sequential(
+            nn.BatchNorm2d(input_nc),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(input_nc, output_nc, 1, bias=False)))
+
+        atrous_nc = output_nc
+        for atrous_rate in atrous_rates:
+            conv = nn.Sequential(
+                nn.BatchNorm2d(output_nc),
+                nn.LeakyReLU(0.2, True),
+                nn.Conv2d(output_nc, atrous_nc, 3, padding=atrous_rate, dilation=atrous_rate, bias=False))
+            modules.append(conv)
+
+        self.convs = nn.ModuleList(modules)
+
+        self.pooling = nn.Sequential(
+            nn.BatchNorm2d(output_nc),
+            nn.LeakyReLU(0.2, True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(output_nc, atrous_nc, 1, bias=False)
+        )
+
+        self.project = nn.Sequential(
+            nn.BatchNorm2d(output_nc + atrous_nc * (len(atrous_rates) + 1)),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(output_nc + atrous_nc * (len(atrous_rates) + 1), output_nc, 1, bias=False)
+        )
+
+    def forward(self, x):
+        size = x.shape[-2:]
+        res = []
+        for conv in self.convs:
+            res.append(conv(x))
+        res.append(F.interpolate(self.pooling(x), size=size, mode='bilinear', align_corners=False))
+        res = torch.cat(res, dim=1)
+        # print(res.shape, self.project)
+        return self.project(res)
+   
+   class ResnetInfoCrossBlock(nn.Module):
+    def __init__(self, dim, B, cross_kernal=3):
+        super(ResnetInfoCrossBlock, self).__init__()
+        self.B = B
+        self.conv1 = nn.Sequential(
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=0, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True)
+        )
+
+        padding = (cross_kernal//2, 0, 0)
+        self.cross = nn.Conv3d(dim, 3*dim, kernel_size=(cross_kernal, 1, 1), padding=padding, groups=dim, bias=False)
+
+        self.conv2 = nn.Sequential(
+            nn.BatchNorm2d(3*dim),
+            nn.ReLU(True),
+            nn.Conv2d(3*dim, dim, 1, groups=dim, bias=False),
+            nn.ReLU(True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=0, bias=False)
+        )
+
+    def forward(self, x):
+        # print(f'x: {x.shape}')
+        out = self.conv1(x)
+        b, C, H, W = out.shape
+        # print(f'1: {out.shape}')
+        out = out.reshape(self.B, b//self.B, C, H, W).permute([0, 2, 1, 3, 4])
+        # print(f'2: {out.shape}')
+        out = self.cross(out)
+        # print(f'3: {out.shape}')
+        out = out.permute([0, 2, 1, 3, 4]).reshape(b, -1, H, W)
+        #　print(f'4: {out.shape}')
+        out = x + self.conv2(out)
+        # print(f'out: {out.shape}')
+        return out
+
+class ResnetInfoCrossBlockV2(nn.Module):
+    def __init__(self, dim, B, cross_kernal=3):
+        super(ResnetInfoCrossBlockV2, self).__init__()
+        self.B = B
+        self.conv1 = nn.Sequential(
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=0, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(True)
+        )
+
+        padding = (cross_kernal//2, 0, 0)
+        self.cross = nn.Conv3d(dim, 3*dim, kernel_size=(cross_kernal, 1, 1), padding=padding, groups=dim, bias=False)
+
+        self.conv2 = nn.Sequential(
+            nn.BatchNorm2d(4*dim),
+            nn.ReLU(True),
+            nn.Conv2d(4*dim, dim, 1, groups=dim, bias=False),
+            nn.ReLU(True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=0, bias=False)
+        )
+
+    def forward(self, x):
+        # print(f'x: {x.shape}')
+        out = self.conv1(x)
+        b, C, H, W = out.shape
+        # print(f'1: {out.shape}')
+        to_cross = out.reshape(self.B, b//self.B, C, H, W).permute([0, 2, 1, 3, 4]) # (B, C, S, H, W)
+        # print(f'2: {out.shape}')
+        cross = self.cross(to_cross) # (B, 3*C, S, H, W); b = B*S
+        # print(f'3: {out.shape}')
+        cross = cross.permute([0, 2, 1, 3, 4]).reshape(b, C, -1, H, W) # (b, C, 3, H, W)
+        out = torch.cat([out[:, :, None, :], cross], dim=2).reshape(b, -1, H, W)
+        #　print(f'4: {out.shape}')
+        out = x + self.conv2(out)
+        # print(f'out: {out.shape}')
+        return out
+   
